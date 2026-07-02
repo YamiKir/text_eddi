@@ -10,20 +10,16 @@
 #include <sys/stat.h>
 #include <fstream>
 #include <locale>
-
 #ifndef NC_RGB
 #define NC_RGB(r,g,b) (((r & 0xff)<<16) | ((g & 0xff)<<8) | (b & 0xff))
 #endif
-
 template <typename T>
 using vector = std::vector<T>;
 using string = std::string;
 using std::cout;
 using std::cerr;
-
-
 const string default_filename = "eddi_unnamed"; //default filename for eddi-term
-
+const unsigned TAB_WIDTH = 4; // how many columns a tab expands to on screen
 void vertical_scroll(unsigned cursor_y, unsigned& scroll_y, int rows){
     unsigned ed_height = rows-1;
     if(cursor_y<scroll_y) scroll_y = cursor_y;
@@ -33,19 +29,15 @@ void horizontal_scroll(unsigned cursor_x, unsigned& scroll_x, int cols){
     if(cursor_x < scroll_x) scroll_x = cursor_x;
         else if(cursor_x >= scroll_x + cols) scroll_x = cursor_x - cols +1;
 }
-
 bool file_has_data(const string& filename){ //checks if a file is empty or not
     struct stat st;
     if(stat(filename.c_str(), &st) != 0) return false;
     return st.st_size > 0;
 }
-
 bool file_exists(const string& filename){
     struct stat st;
     return stat(filename.c_str(), &st) == 0;
 }
-
-
 vector<string> read_file(const string& filename){ //turns the file into a series of vectors/lines
     std::ifstream in(filename);
     vector<string> lines;
@@ -54,8 +46,6 @@ vector<string> read_file(const string& filename){ //turns the file into a series
     if(lines.empty()) lines.push_back("");
     return lines;
 }
-
-
 bool save_file(const string& filename, const vector<string>& lines){
     std::ofstream out(filename, std::ios::trunc);
     if(!out) return false;
@@ -66,32 +56,72 @@ bool save_file(const string& filename, const vector<string>& lines){
     out.flush();
     return (bool)out;
 }
-
 // ---- UTF-8 helpers ----
 // Keep byte-offset cursors pinned to codepoint boundaries so multi-byte
 // characters never get split by cursor movement, backspace, or delete.
 bool utf8_is_cont(unsigned char c){ return (c & 0xC0) == 0x80; }
-
 size_t utf8_prev(const string& s, size_t pos){
     if(pos == 0) return 0;
     pos--;
     while(pos > 0 && utf8_is_cont((unsigned char)s[pos])) pos--;
     return pos;
 }
-
 size_t utf8_next(const string& s, size_t pos){
     if(pos >= s.size()) return s.size();
     pos++;
     while(pos < s.size() && utf8_is_cont((unsigned char)s[pos])) pos++;
     return pos;
 }
-
 size_t utf8_snap(const string& s, size_t pos){
     if(pos > s.size()) pos = s.size();
     while(pos > 0 && pos < s.size() && utf8_is_cont((unsigned char)s[pos])) pos--;
     return pos;
 }
-
+// ---- Display-column helpers ----
+// cursor_x is always a BYTE offset into the line (required, since we
+// insert/erase into std::string by byte position). It is NOT the same
+// thing as the on-screen column whenever the line contains a tab, because
+// a tab is a single byte but expands to a variable number of columns.
+// These two helpers are the single source of truth for converting a byte
+// offset into a screen column (and for rendering a line with tabs
+// expanded), so scrolling and cursor placement never desync from what's
+// actually drawn on screen.
+unsigned display_col(const string& line, size_t byte_pos){
+    unsigned col = 0;
+    size_t i = 0;
+    while(i < byte_pos && i < line.size()){
+        unsigned char c = (unsigned char)line[i];
+        if(c == '\t'){
+            col += TAB_WIDTH - (col % TAB_WIDTH);
+            i++;
+        } else if(!utf8_is_cont(c)){
+            col++;
+            i = utf8_next(line, i);
+        } else {
+            i++; // stray continuation byte at a bad boundary, shouldn't happen
+        }
+    }
+    return col;
+}
+// Renders a line for display with tabs expanded to spaces. Used only for
+// drawing -- the underlying buffer still stores the real '\t' byte, so
+// saving to disk is unaffected.
+string expand_tabs(const string& line){
+    string out;
+    unsigned col = 0;
+    for(size_t i = 0; i < line.size(); i++){
+        unsigned char c = (unsigned char)line[i];
+        if(c == '\t'){
+            unsigned spaces = TAB_WIDTH - (col % TAB_WIDTH);
+            out.append(spaces, ' ');
+            col += spaces;
+        } else {
+            out.push_back(line[i]);
+            if(!utf8_is_cont(c)) col++;
+        }
+    }
+    return out;
+}
 // Manual US-QWERTY shift map, used ONLY as a fallback when the terminal
 // reports a Shift modifier but doesn't send a resolved shifted character
 // via ni.utf8 (a real gap in some terminals). Terminals with full Kitty
@@ -125,7 +155,6 @@ char shifted_char(char c){
             return c;
     }
 }
-
 void display_status(ncplane* ns, unsigned rows, unsigned cols,int cursor_y, int cursor_x, const vector<string>& lines,uint32_t old_bg, uint32_t old_fg,
                     const string& filename, const string& status_msg,
                     bool renaming, const string& rename_buffer){
@@ -137,18 +166,17 @@ void display_status(ncplane* ns, unsigned rows, unsigned cols,int cursor_y, int 
     } else if(!status_msg.empty()){
         ncplane_printf_yx(ns, rows-1, 0, "[%s] %s", filename.c_str(), status_msg.c_str());
     } else {
+        unsigned dcol = display_col(lines[cursor_y], (size_t)cursor_x);
         ncplane_printf_yx(ns, rows-1, 0,
             "[%s] Line %u/%zu Col %u/%zu (ESC=quit, Ctrl+S=save, Ctrl+R=rename)",
             filename.c_str(),
             cursor_y+1, lines.size(),
-            cursor_x+1, lines[cursor_y].size());
+            dcol+1, lines[cursor_y].size());
     }
-
     ncplane_set_bg_rgb(ns, old_bg);
     ncplane_set_fg_rgb(ns, old_fg);
-
 }
-void cursor_placement(ncplane* ns, unsigned cursor_y, unsigned cursor_x, bool renaming, unsigned rename_cursor, unsigned rows, unsigned cols, struct notcurses* nc,int ed_height, int scroll_y, int scroll_x){
+void cursor_placement(ncplane* ns, unsigned cursor_y, unsigned cursor_x, bool renaming, unsigned rename_cursor, unsigned rows, unsigned cols, struct notcurses* nc,int ed_height, int scroll_y, int scroll_x, const string& current_line){
     if(renaming){
         // Cursor sits inside the "Rename to: " prompt on the status line.
         unsigned prefix_len = (unsigned)string("Rename to: ").size();
@@ -156,7 +184,10 @@ void cursor_placement(ncplane* ns, unsigned cursor_y, unsigned cursor_x, bool re
         notcurses_cursor_enable(nc, rows-1, screen_x);
     } else {
         int screen_y = cursor_y - scroll_y;
-        int screen_x = cursor_x - scroll_x;
+        // Convert the byte-offset cursor_x into an actual screen column,
+        // expanding tabs as it walks the line -- this is what keeps the
+        // visible cursor glued to the same spot the buffer thinks it's at.
+        int screen_x = (int)display_col(current_line, (size_t)cursor_x) - scroll_x;
         if(screen_y >= 0 && screen_y < (int)ed_height && screen_x >= 0 && screen_x < (int)cols){
             notcurses_cursor_enable(nc, screen_y, screen_x);
         }
@@ -165,11 +196,14 @@ void cursor_placement(ncplane* ns, unsigned cursor_y, unsigned cursor_x, bool re
 void display_visible_lines(ncplane* ns, const vector<string>& lines, unsigned scroll_y, unsigned scroll_x, unsigned ed_height, unsigned cols, uint32_t old_fg, uint32_t old_bg){
     ncplane_set_fg_rgb(ns, old_fg);
     ncplane_set_bg_rgb(ns, old_bg);
-
     for(unsigned i=0;i<ed_height;i++){
         unsigned line_idx = scroll_y + i;
         if(line_idx >= lines.size()) break;
-        string line = lines[line_idx];
+        // Expand tabs before slicing by scroll_x/cols, since scroll_x is
+        // now tracked in screen columns, not raw bytes. Expanded output
+        // is single-byte-per-column ASCII wherever tabs were, so the
+        // substr below lines up with what horizontal_scroll computed.
+        string line = expand_tabs(lines[line_idx]);
         if(line.size() > scroll_x){
             string visible = line.substr(scroll_x, cols);
             ncplane_printf_yx(ns, i, 0, "%s", visible.c_str());
@@ -177,7 +211,6 @@ void display_visible_lines(ncplane* ns, const vector<string>& lines, unsigned sc
             ncplane_printf_yx(ns, i, 0, "");
         }
     }
-
 }
 void draw_buffer(ncplane* ns, const vector<string>& lines,
                  unsigned cursor_y, unsigned cursor_x,
@@ -186,26 +219,20 @@ void draw_buffer(ncplane* ns, const vector<string>& lines,
                  const string& filename, struct notcurses* nc,
                  const string& status_msg,
                  bool renaming, const string& rename_buffer, unsigned rename_cursor){
-
     ncplane_erase(ns);
     unsigned ed_height = rows - 1; // last line reserved for status
     uint32_t old_bg = NC_RGB(30,30,30), old_fg = NC_RGB(200,200,200);
-
     //shows the visible lines of the buffer, based on scroll position and window size
     display_visible_lines(ns, lines, scroll_y, scroll_x, ed_height, cols, old_fg, old_bg);
-
     //status line at the bottom of application
     display_status(ns, rows, cols, cursor_y, cursor_x, lines, old_bg, old_fg,
                    filename, status_msg, renaming, rename_buffer);
-
     //cursor logic if renaming, cursor is placed in the rename prompt, otherwise it is placed in the buffer
-    
-    cursor_placement(ns, cursor_y, cursor_x, renaming, rename_cursor, rows, cols, nc, ed_height, scroll_y, scroll_x);
-
+    unsigned safe_y = (cursor_y < lines.size()) ? cursor_y : (lines.empty() ? 0 : (unsigned)lines.size()-1);
+    const string& current_line = lines.empty() ? rename_buffer /* unused placeholder, renaming path ignores this */ : lines[safe_y];
+    cursor_placement(ns, cursor_y, cursor_x, renaming, rename_cursor, rows, cols, nc, ed_height, scroll_y, scroll_x, current_line);
     notcurses_render(nc);
 }
-
-
 bool handleRenameInput(
     const ncinput& ni,
     bool shift_held,
@@ -217,15 +244,12 @@ bool handleRenameInput(
 ){
     if(ni.id == NCKEY_ENTER || ni.id == '\n'){
         std::string new_name = rename_buffer;
-
         while(!new_name.empty() &&
               (new_name.front() == ' ' || new_name.front() == '\t'))
             new_name.erase(new_name.begin());
-
         while(!new_name.empty() &&
               (new_name.back() == ' ' || new_name.back() == '\t'))
             new_name.pop_back();
-
         if(new_name.empty()){
             status_msg = "Rename cancelled: name cannot be empty.";
             renaming = false;
@@ -272,18 +296,21 @@ bool handleRenameInput(
     else if(ni.id == NCKEY_END){
         rename_cursor = (unsigned)rename_buffer.size();
     }
-    else if(ni.utf8[0] != '\0'){
+    else if(ni.id == NCKEY_TAB || ni.id == '\t'){
+        // No-op: a tab (or any other control byte) has no business in a
+        // filename, and inserting one here would desync rename_cursor
+        // from the visible prompt column exactly the way it used to
+        // desync the main editor cursor.
+    }
+    else if(ni.utf8[0] != '\0' && (unsigned char)ni.utf8[0] >= 0x20){
         char base = (ni.id >= 32 && ni.id < 127)
                         ? (char)ni.id
                         : '\0';
-
         bool utf8_has_shifted =
             !(ni.utf8[1] == '\0' &&
               base != '\0' &&
               ni.utf8[0] == base);
-
         std::string s;
-
         if(utf8_has_shifted){
             s = std::string(ni.utf8);
         } else if(shift_held && base != '\0'){
@@ -291,7 +318,6 @@ bool handleRenameInput(
         } else {
             s = std::string(ni.utf8);
         }
-
         rename_buffer.insert(rename_cursor, s);
         rename_cursor += (unsigned)s.size();
     }
@@ -301,7 +327,6 @@ bool handleRenameInput(
         rename_buffer.insert(rename_cursor, 1, to_insert);
         ++rename_cursor;
     }
-
     return true;
 }
 void handle_normal_input(const ncinput& ni, int rows, int cols, bool shift_held, bool ctrl_held,
@@ -309,7 +334,6 @@ void handle_normal_input(const ncinput& ni, int rows, int cols, bool shift_held,
                          unsigned& cursor_y, unsigned& cursor_x,
                          string& status_msg, const string& filename, bool& is_ctrl_r, bool& is_ctrl_s, bool& renaming, string& rename_buffer, unsigned& rename_cursor){
     status_msg.clear(); // any keypress dismisses a prior status message
-
         if(is_ctrl_r){ // enter rename mode
             renaming = true;
             rename_buffer = filename;
@@ -371,10 +395,17 @@ void handle_normal_input(const ncinput& ni, int rows, int cols, bool shift_held,
         } else if(is_ctrl_s){ // Ctrl+S
             bool ok = save_file(filename, lines);
             status_msg = ok ? "Saved." : "SAVE FAILED (check disk space / permissions).";
-        } else if(ni.utf8[0] != '\0'){
+        } else if(ni.id == NCKEY_TAB || ni.id == '\t'){
+            // Insert a real tab byte. cursor_x still just advances by 1
+            // byte here -- that part was always correct, since a tab is
+            // exactly one byte. What used to break was rendering/scroll
+            // code treating that one byte as one *column*; those are now
+            // fixed via display_col()/expand_tabs() instead of here.
+            lines[cursor_y].insert(cursor_x, 1, '\t');
+            cursor_x++;
+        } else if(ni.utf8[0] != '\0' && (unsigned char)ni.utf8[0] >= 0x20){
             char base = (ni.id >= 32 && ni.id < 127) ? (char)ni.id : '\0';
             bool utf8_has_shifted = !(ni.utf8[1] == '\0' && base != '\0' && ni.utf8[0] == base);
-
             if(utf8_has_shifted){
                 // Trust the terminal's resolution — correct for the
                 // user's real layout whenever the terminal supports it.
@@ -399,22 +430,18 @@ void handle_normal_input(const ncinput& ni, int rows, int cols, bool shift_held,
             cursor_x++;
         }
 }
-
 void handle_input(struct notcurses* nc, ncplane* stdplane, vector<string>& lines,
                   unsigned& cursor_y, unsigned& cursor_x,
                   unsigned& scroll_y, unsigned& scroll_x,
                   unsigned rows, unsigned cols,
                   string& filename, string& status_msg,
                   bool& renaming, string& rename_buffer, unsigned& rename_cursor){
-
                     ncinput ni;
     for(;;){
         uint32_t id = notcurses_get_blocking(nc, &ni);
-
         // Kitty keyboard protocol sends both press and release events.
         // We only want to act on press/repeat, not release.
         if(ni.evtype == NCTYPE_RELEASE) continue;
-
         // ESC behaves differently depending on mode: cancels renaming if
         // we're in that mode, otherwise quits the editor as before.
         
@@ -428,19 +455,15 @@ void handle_input(struct notcurses* nc, ncplane* stdplane, vector<string>& lines
             }
             break;
         }
-
         // Defensive bounds check against future edits introducing a bug.
         if(cursor_y >= lines.size()) cursor_y = lines.empty() ? 0 : (unsigned)lines.size()-1;
         if(lines.empty()) lines.push_back("");
-
         bool shift_held = (ni.modifiers & NCKEY_MOD_SHIFT) != 0;
         bool ctrl_held  = (ni.modifiers & NCKEY_MOD_CTRL) != 0;
-
         bool is_ctrl_s = (ni.id == 19) ||
                           (ctrl_held && (ni.id == 's' || ni.id == 'S'));
         bool is_ctrl_r = (ni.id == 18) || // legacy Ctrl+R byte code
                           (ctrl_held && (ni.id == 'r' || ni.id == 'R'));
-
         // ---------------- RENAME MODE ----------------
         // While renaming, keystrokes edit rename_buffer instead of the
         // document. Normal editing input is fully suspended so nothing
@@ -455,7 +478,6 @@ void handle_input(struct notcurses* nc, ncplane* stdplane, vector<string>& lines
         filename,
         status_msg
     );
-
     draw_buffer(stdplane, lines,
                 cursor_y, cursor_x,
                 scroll_y, scroll_x,
@@ -465,10 +487,8 @@ void handle_input(struct notcurses* nc, ncplane* stdplane, vector<string>& lines
                 renaming,
                 rename_buffer,
                 rename_cursor);
-
     continue;
 }
-
         // ---------------- NORMAL EDITING MODE ----------------
         handle_normal_input(
             ni,
@@ -486,23 +506,24 @@ void handle_input(struct notcurses* nc, ncplane* stdplane, vector<string>& lines
             rename_buffer,
             rename_cursor
         );
-
         //vertical scrolling
        vertical_scroll(cursor_y, scroll_y, rows);
-
-        //horiz scrolling
-        horizontal_scroll(cursor_x, scroll_x, cols);
-
+        //horiz scrolling -- scroll_x is tracked in screen COLUMNS, not
+        //raw bytes, so convert cursor_x through display_col() first.
+        //This is what keeps horizontal scroll (and therefore the visible
+        //cursor position) glued to the right spot on lines containing
+        //tabs, instead of drifting the way it used to.
+        {
+            unsigned dcol = display_col(lines[cursor_y], (size_t)cursor_x);
+            horizontal_scroll(dcol, scroll_x, cols);
+        }
         draw_buffer(stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x, rows, cols,
                     filename, nc, status_msg, renaming, rename_buffer, rename_cursor);
     }
-
-
                   }
 int main(int argc, char* argv[]){
     string filename = argc > 1 ? argv[1] : default_filename;
     vector<string> lines;
-
     if(file_has_data(filename)){
         cout << filename << " already exists, loading...\n";
         lines = read_file(filename);
@@ -512,33 +533,26 @@ int main(int argc, char* argv[]){
         initfile.close();
         lines.push_back("");
     }
-
     setlocale(LC_ALL,"");
     notcurses_options opts{};
     struct notcurses* nc = notcurses_core_init(&opts, nullptr);
     if(!nc){ cerr << "Failed to initialize Notcurses\n"; return 1; }
-
     unsigned rows, cols;
     ncplane* stdplane = notcurses_stddim_yx(nc, &rows, &cols);
-
     notcurses_cursor_enable(nc,0,0);
     unsigned cursor_y=0, cursor_x=0;
     unsigned scroll_y=0, scroll_x=0;
     string status_msg; // transient message (save result, rename result, errors)
-
     // Rename-mode state
     bool renaming = false;
     string rename_buffer;
     unsigned rename_cursor = 0;
-
     draw_buffer(stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x, rows, cols,
                 filename, nc, status_msg, renaming, rename_buffer, rename_cursor);
-
     // Main event loop
     handle_input(nc, stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x,
                  rows, cols, filename, status_msg,
                  renaming, rename_buffer, rename_cursor);
-
     if(!save_file(filename, lines)){
         cerr << "Warning: failed to save " << filename << " on exit.\n";
     }
