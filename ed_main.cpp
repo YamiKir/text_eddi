@@ -22,8 +22,17 @@ using std::cout;
 using std::cerr;
 
 
-string default_filename = "eddi_unnamed"; //default filename for eddi-term
+const string default_filename = "eddi_unnamed"; //default filename for eddi-term
 
+void vertical_scroll(unsigned cursor_y, unsigned& scroll_y, int rows){
+    unsigned ed_height = rows-1;
+    if(cursor_y<scroll_y) scroll_y = cursor_y;
+    else if(cursor_y >= scroll_y + ed_height) scroll_y = cursor_y - ed_height +1;
+}
+void horizontal_scroll(unsigned cursor_x, unsigned& scroll_x, int cols){
+    if(cursor_x < scroll_x) scroll_x = cursor_x;
+        else if(cursor_x >= scroll_x + cols) scroll_x = cursor_x - cols +1;
+}
 
 bool file_has_data(const string& filename){ //checks if a file is empty or not
     struct stat st;
@@ -117,34 +126,9 @@ char shifted_char(char c){
     }
 }
 
-void draw_buffer(ncplane* ns, const vector<string>& lines,
-                 unsigned cursor_y, unsigned cursor_x,
-                 unsigned scroll_y, unsigned scroll_x,
-                 unsigned rows, unsigned cols,
-                 const string& filename, struct notcurses* nc,
-                 const string& status_msg,
-                 bool renaming, const string& rename_buffer, unsigned rename_cursor){
-
-    ncplane_erase(ns);
-    unsigned ed_height = rows - 1; // last line reserved for status
-    uint32_t old_bg = NC_RGB(30,30,30), old_fg = NC_RGB(200,200,200);
-
-    ncplane_set_fg_rgb(ns, old_fg);
-    ncplane_set_bg_rgb(ns, old_bg);
-
-    for(unsigned i=0;i<ed_height;i++){
-        unsigned line_idx = scroll_y + i;
-        if(line_idx >= lines.size()) break;
-        string line = lines[line_idx];
-        if(line.size() > scroll_x){
-            string visible = line.substr(scroll_x, cols);
-            ncplane_printf_yx(ns, i, 0, "%s", visible.c_str());
-        } else {
-            ncplane_printf_yx(ns, i, 0, "");
-        }
-    }
-
-    //status line at the bottom of application
+void display_status(ncplane* ns, unsigned rows, unsigned cols,int cursor_y, int cursor_x, const vector<string>& lines,uint32_t old_bg, uint32_t old_fg,
+                    const string& filename, const string& status_msg,
+                    bool renaming, const string& rename_buffer){
     ncplane_set_bg_rgb(ns, NC_RGB(50,50,150));
     ncplane_set_fg_rgb(ns, NC_RGB(200,200,200));
     if(renaming){
@@ -163,7 +147,8 @@ void draw_buffer(ncplane* ns, const vector<string>& lines,
     ncplane_set_bg_rgb(ns, old_bg);
     ncplane_set_fg_rgb(ns, old_fg);
 
-    //cursor logic
+}
+void cursor_placement(ncplane* ns, unsigned cursor_y, unsigned cursor_x, bool renaming, unsigned rename_cursor, unsigned rows, unsigned cols, struct notcurses* nc,int ed_height, int scroll_y, int scroll_x){
     if(renaming){
         // Cursor sits inside the "Rename to: " prompt on the status line.
         unsigned prefix_len = (unsigned)string("Rename to: ").size();
@@ -176,158 +161,154 @@ void draw_buffer(ncplane* ns, const vector<string>& lines,
             notcurses_cursor_enable(nc, screen_y, screen_x);
         }
     }
+}
+void display_visible_lines(ncplane* ns, const vector<string>& lines, unsigned scroll_y, unsigned scroll_x, unsigned ed_height, unsigned cols, uint32_t old_fg, uint32_t old_bg){
+    ncplane_set_fg_rgb(ns, old_fg);
+    ncplane_set_bg_rgb(ns, old_bg);
+
+    for(unsigned i=0;i<ed_height;i++){
+        unsigned line_idx = scroll_y + i;
+        if(line_idx >= lines.size()) break;
+        string line = lines[line_idx];
+        if(line.size() > scroll_x){
+            string visible = line.substr(scroll_x, cols);
+            ncplane_printf_yx(ns, i, 0, "%s", visible.c_str());
+        } else {
+            ncplane_printf_yx(ns, i, 0, "");
+        }
+    }
+
+}
+void draw_buffer(ncplane* ns, const vector<string>& lines,
+                 unsigned cursor_y, unsigned cursor_x,
+                 unsigned scroll_y, unsigned scroll_x,
+                 unsigned rows, unsigned cols,
+                 const string& filename, struct notcurses* nc,
+                 const string& status_msg,
+                 bool renaming, const string& rename_buffer, unsigned rename_cursor){
+
+    ncplane_erase(ns);
+    unsigned ed_height = rows - 1; // last line reserved for status
+    uint32_t old_bg = NC_RGB(30,30,30), old_fg = NC_RGB(200,200,200);
+
+    //shows the visible lines of the buffer, based on scroll position and window size
+    display_visible_lines(ns, lines, scroll_y, scroll_x, ed_height, cols, old_fg, old_bg);
+
+    //status line at the bottom of application
+    display_status(ns, rows, cols, cursor_y, cursor_x, lines, old_bg, old_fg,
+                   filename, status_msg, renaming, rename_buffer);
+
+    //cursor logic if renaming, cursor is placed in the rename prompt, otherwise it is placed in the buffer
+    
+    cursor_placement(ns, cursor_y, cursor_x, renaming, rename_cursor, rows, cols, nc, ed_height, scroll_y, scroll_x);
 
     notcurses_render(nc);
 }
 
-int main(int argc, char* argv[]){
-    string filename = argc > 1 ? argv[1] : default_filename;
-    vector<string> lines;
 
-    if(file_has_data(filename)){
-        cout << filename << " already exists, loading...\n";
-        lines = read_file(filename);
-    } else {
-        cout << filename << " is new or empty, starting fresh...\n";
-        std::ofstream initfile(filename);
-        initfile.close();
-        lines.push_back("");
+bool handleRenameInput(
+    const ncinput& ni,
+    bool shift_held,
+    bool& renaming,
+    std::string& rename_buffer,
+    unsigned& rename_cursor,
+    std::string& filename,
+    std::string& status_msg
+){
+    if(ni.id == NCKEY_ENTER || ni.id == '\n'){
+        std::string new_name = rename_buffer;
+
+        while(!new_name.empty() &&
+              (new_name.front() == ' ' || new_name.front() == '\t'))
+            new_name.erase(new_name.begin());
+
+        while(!new_name.empty() &&
+              (new_name.back() == ' ' || new_name.back() == '\t'))
+            new_name.pop_back();
+
+        if(new_name.empty()){
+            status_msg = "Rename cancelled: name cannot be empty.";
+            renaming = false;
+        } else if(new_name == filename){
+            status_msg = "Name unchanged.";
+            renaming = false;
+        } else if(file_exists(new_name)){
+            status_msg = "Rename failed: '" + new_name + "' already exists.";
+        } else {
+            if(std::rename(filename.c_str(), new_name.c_str()) == 0){
+                filename = new_name;
+                status_msg = "Renamed to '" + filename + "'.";
+                renaming = false;
+            } else {
+                status_msg =
+                    std::string("Rename failed: ") + std::strerror(errno);
+            }
+        }
+    }
+    else if(ni.id == NCKEY_BACKSPACE || ni.id == 127){
+        if(rename_cursor > 0){
+            size_t start = utf8_prev(rename_buffer, rename_cursor);
+            rename_buffer.erase(start, rename_cursor - start);
+            rename_cursor = (unsigned)start;
+        }
+    }
+    else if(ni.id == NCKEY_DEL){
+        if(rename_cursor < rename_buffer.size()){
+            size_t end = utf8_next(rename_buffer, rename_cursor);
+            rename_buffer.erase(rename_cursor, end - rename_cursor);
+        }
+    }
+    else if(ni.id == NCKEY_LEFT){
+        if(rename_cursor > 0)
+            rename_cursor = (unsigned)utf8_prev(rename_buffer, rename_cursor);
+    }
+    else if(ni.id == NCKEY_RIGHT){
+        if(rename_cursor < rename_buffer.size())
+            rename_cursor = (unsigned)utf8_next(rename_buffer, rename_cursor);
+    }
+    else if(ni.id == NCKEY_HOME){
+        rename_cursor = 0;
+    }
+    else if(ni.id == NCKEY_END){
+        rename_cursor = (unsigned)rename_buffer.size();
+    }
+    else if(ni.utf8[0] != '\0'){
+        char base = (ni.id >= 32 && ni.id < 127)
+                        ? (char)ni.id
+                        : '\0';
+
+        bool utf8_has_shifted =
+            !(ni.utf8[1] == '\0' &&
+              base != '\0' &&
+              ni.utf8[0] == base);
+
+        std::string s;
+
+        if(utf8_has_shifted){
+            s = std::string(ni.utf8);
+        } else if(shift_held && base != '\0'){
+            s = std::string(1, shifted_char(base));
+        } else {
+            s = std::string(ni.utf8);
+        }
+
+        rename_buffer.insert(rename_cursor, s);
+        rename_cursor += (unsigned)s.size();
+    }
+    else if(ni.id >= 32 && ni.id < 127){
+        char c = (char)ni.id;
+        char to_insert = shift_held ? shifted_char(c) : c;
+        rename_buffer.insert(rename_cursor, 1, to_insert);
+        ++rename_cursor;
     }
 
-    setlocale(LC_ALL,"");
-    notcurses_options opts{};
-    struct notcurses* nc = notcurses_core_init(&opts, nullptr);
-    if(!nc){ cerr << "Failed to initialize Notcurses\n"; return 1; }
-
-    unsigned rows, cols;
-    ncplane* stdplane = notcurses_stddim_yx(nc, &rows, &cols);
-
-    notcurses_cursor_enable(nc,0,0);
-    unsigned cursor_y=0, cursor_x=0;
-    unsigned scroll_y=0, scroll_x=0;
-    string status_msg; // transient message (save result, rename result, errors)
-
-    // Rename-mode state
-    bool renaming = false;
-    string rename_buffer;
-    unsigned rename_cursor = 0;
-
-    draw_buffer(stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x, rows, cols,
-                filename, nc, status_msg, renaming, rename_buffer, rename_cursor);
-
-    ncinput ni;
-    for(;;){
-        uint32_t id = notcurses_get_blocking(nc, &ni);
-
-        // Kitty keyboard protocol sends both press and release events.
-        // We only want to act on press/repeat, not release.
-        if(ni.evtype == NCTYPE_RELEASE) continue;
-
-        // ESC behaves differently depending on mode: cancels renaming if
-        // we're in that mode, otherwise quits the editor as before.
-        if(id == NCKEY_ESC){
-            if(renaming){
-                renaming = false;
-                status_msg = "Rename cancelled.";
-                draw_buffer(stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x, rows, cols,
-                            filename, nc, status_msg, renaming, rename_buffer, rename_cursor);
-                continue;
-            }
-            break;
-        }
-
-        // Defensive bounds check against future edits introducing a bug.
-        if(cursor_y >= lines.size()) cursor_y = lines.empty() ? 0 : (unsigned)lines.size()-1;
-        if(lines.empty()) lines.push_back("");
-
-        bool shift_held = (ni.modifiers & NCKEY_MOD_SHIFT) != 0;
-        bool ctrl_held  = (ni.modifiers & NCKEY_MOD_CTRL) != 0;
-
-        bool is_ctrl_s = (ni.id == 19) ||
-                          (ctrl_held && (ni.id == 's' || ni.id == 'S'));
-        bool is_ctrl_r = (ni.id == 18) || // legacy Ctrl+R byte code
-                          (ctrl_held && (ni.id == 'r' || ni.id == 'R'));
-
-        // ---------------- RENAME MODE ----------------
-        // While renaming, keystrokes edit rename_buffer instead of the
-        // document. Normal editing input is fully suspended so nothing
-        // leaks through into the buffer by accident.
-        if(renaming){
-            if(ni.id == NCKEY_ENTER || ni.id == '\n'){
-                string new_name = rename_buffer;
-                // trim accidental leading/trailing whitespace
-                while(!new_name.empty() && (new_name.front()==' '||new_name.front()=='\t'))
-                    new_name.erase(new_name.begin());
-                while(!new_name.empty() && (new_name.back()==' '||new_name.back()=='\t'))
-                    new_name.pop_back();
-
-                if(new_name.empty()){
-                    status_msg = "Rename cancelled: name cannot be empty.";
-                    renaming = false;
-                } else if(new_name == filename){
-                    status_msg = "Name unchanged.";
-                    renaming = false;
-                } else if(file_exists(new_name)){
-                    status_msg = "Rename failed: '" + new_name + "' already exists.";
-                    // stay in rename mode so the user can pick another name
-                } else {
-                    // True filesystem rename: moves the existing inode to
-                    // the new name, no leftover file under the old name.
-                    if(std::rename(filename.c_str(), new_name.c_str()) == 0){
-                        filename = new_name;
-                        status_msg = "Renamed to '" + filename + "'.";
-                        renaming = false;
-                    } else {
-                        status_msg = string("Rename failed: ") + std::strerror(errno);
-                        // stay in rename mode
-                    }
-                }
-            } else if(ni.id == NCKEY_BACKSPACE || ni.id == 127){
-                if(rename_cursor > 0){
-                    size_t start = utf8_prev(rename_buffer, rename_cursor);
-                    rename_buffer.erase(start, rename_cursor - start);
-                    rename_cursor = (unsigned)start;
-                }
-            } else if(ni.id == NCKEY_DEL){
-                if(rename_cursor < rename_buffer.size()){
-                    size_t end = utf8_next(rename_buffer, rename_cursor);
-                    rename_buffer.erase(rename_cursor, end - rename_cursor);
-                }
-            } else if(ni.id == NCKEY_LEFT){
-                if(rename_cursor > 0) rename_cursor = (unsigned)utf8_prev(rename_buffer, rename_cursor);
-            } else if(ni.id == NCKEY_RIGHT){
-                if(rename_cursor < rename_buffer.size()) rename_cursor = (unsigned)utf8_next(rename_buffer, rename_cursor);
-            } else if(ni.id == NCKEY_HOME){
-                rename_cursor = 0;
-            } else if(ni.id == NCKEY_END){
-                rename_cursor = (unsigned)rename_buffer.size();
-            } else if(ni.utf8[0] != '\0'){
-                char base = (ni.id >= 32 && ni.id < 127) ? (char)ni.id : '\0';
-                bool utf8_has_shifted = !(ni.utf8[1] == '\0' && base != '\0' && ni.utf8[0] == base);
-                string s;
-                if(utf8_has_shifted){
-                    s = string(ni.utf8);
-                } else if(shift_held && base != '\0'){
-                    s = string(1, shifted_char(base));
-                } else {
-                    s = string(ni.utf8);
-                }
-                rename_buffer.insert(rename_cursor, s);
-                rename_cursor += (unsigned)s.size();
-            } else if(ni.id >= 32 && ni.id < 127){
-                char c = (char)ni.id;
-                char to_insert = shift_held ? shifted_char(c) : c;
-                rename_buffer.insert(rename_cursor,1,to_insert);
-                rename_cursor++;
-            }
-
-            draw_buffer(stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x, rows, cols,
-                        filename, nc, status_msg, renaming, rename_buffer, rename_cursor);
-            continue; // skip normal-mode handling entirely while renaming
-        }
-
-        // ---------------- NORMAL EDITING MODE ----------------
-        status_msg.clear(); // any keypress dismisses a prior status message
+    return true;
+}
+void handle_normal_input(const ncinput& ni, int rows, int cols, bool shift_held, bool ctrl_held,
+                         vector<string>& lines,
+                         unsigned& cursor_y, unsigned& cursor_x,
+                         string& status_msg, const string& filename, bool& is_ctrl_r, bool& is_ctrl_s, bool& renaming, string& rename_buffer, unsigned& rename_cursor){
+    status_msg.clear(); // any keypress dismisses a prior status message
 
         if(is_ctrl_r){ // enter rename mode
             renaming = true;
@@ -417,19 +398,147 @@ int main(int argc, char* argv[]){
             lines[cursor_y].insert(cursor_x,1,to_insert);
             cursor_x++;
         }
+}
+
+void handle_input(struct notcurses* nc, ncplane* stdplane, vector<string>& lines,
+                  unsigned& cursor_y, unsigned& cursor_x,
+                  unsigned& scroll_y, unsigned& scroll_x,
+                  unsigned rows, unsigned cols,
+                  string& filename, string& status_msg,
+                  bool& renaming, string& rename_buffer, unsigned& rename_cursor){
+
+                    ncinput ni;
+    for(;;){
+        uint32_t id = notcurses_get_blocking(nc, &ni);
+
+        // Kitty keyboard protocol sends both press and release events.
+        // We only want to act on press/repeat, not release.
+        if(ni.evtype == NCTYPE_RELEASE) continue;
+
+        // ESC behaves differently depending on mode: cancels renaming if
+        // we're in that mode, otherwise quits the editor as before.
+        
+        if(id == NCKEY_ESC){
+            if(renaming){
+                renaming = false;
+                status_msg = "Rename cancelled.";
+                draw_buffer(stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x, rows, cols,
+                            filename, nc, status_msg, renaming, rename_buffer, rename_cursor);
+                continue;
+            }
+            break;
+        }
+
+        // Defensive bounds check against future edits introducing a bug.
+        if(cursor_y >= lines.size()) cursor_y = lines.empty() ? 0 : (unsigned)lines.size()-1;
+        if(lines.empty()) lines.push_back("");
+
+        bool shift_held = (ni.modifiers & NCKEY_MOD_SHIFT) != 0;
+        bool ctrl_held  = (ni.modifiers & NCKEY_MOD_CTRL) != 0;
+
+        bool is_ctrl_s = (ni.id == 19) ||
+                          (ctrl_held && (ni.id == 's' || ni.id == 'S'));
+        bool is_ctrl_r = (ni.id == 18) || // legacy Ctrl+R byte code
+                          (ctrl_held && (ni.id == 'r' || ni.id == 'R'));
+
+        // ---------------- RENAME MODE ----------------
+        // While renaming, keystrokes edit rename_buffer instead of the
+        // document. Normal editing input is fully suspended so nothing
+        // leaks through into the buffer by accident.
+        if(renaming){
+    handleRenameInput(
+        ni,
+        shift_held,
+        renaming,
+        rename_buffer,
+        rename_cursor,
+        filename,
+        status_msg
+    );
+
+    draw_buffer(stdplane, lines,
+                cursor_y, cursor_x,
+                scroll_y, scroll_x,
+                rows, cols,
+                filename, nc,
+                status_msg,
+                renaming,
+                rename_buffer,
+                rename_cursor);
+
+    continue;
+}
+
+        // ---------------- NORMAL EDITING MODE ----------------
+        handle_normal_input(
+            ni,
+            rows, cols,
+            shift_held,
+            ctrl_held,
+            lines,
+            cursor_y,
+            cursor_x,
+            status_msg,
+            filename,
+            is_ctrl_r,
+            is_ctrl_s,
+            renaming,
+            rename_buffer,
+            rename_cursor
+        );
 
         //vertical scrolling
-        unsigned ed_height = rows-1;
-        if(cursor_y<scroll_y) scroll_y = cursor_y;
-        else if(cursor_y >= scroll_y + ed_height) scroll_y = cursor_y - ed_height +1;
+       vertical_scroll(cursor_y, scroll_y, rows);
 
-        //horiz scrolling
-        if(cursor_x < scroll_x) scroll_x = cursor_x;
-        else if(cursor_x >= scroll_x + cols) scroll_x = cursor_x - cols +1;
+        //horiz scrollingif(cursor_x < scroll_x) scroll_x = cursor_x;
+    else if(cursor_x >= scroll_x + cols) scroll_x = cursor_x - cols +1;
+        horizontal_scroll(cursor_x, scroll_x, cols);
 
         draw_buffer(stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x, rows, cols,
                     filename, nc, status_msg, renaming, rename_buffer, rename_cursor);
     }
+
+
+                  }
+int main(int argc, char* argv[]){
+    string filename = argc > 1 ? argv[1] : default_filename;
+    vector<string> lines;
+
+    if(file_has_data(filename)){
+        cout << filename << " already exists, loading...\n";
+        lines = read_file(filename);
+    } else {
+        cout << filename << " is new or empty, starting fresh...\n";
+        std::ofstream initfile(filename);
+        initfile.close();
+        lines.push_back("");
+    }
+
+    setlocale(LC_ALL,"");
+    notcurses_options opts{};
+    struct notcurses* nc = notcurses_core_init(&opts, nullptr);
+    if(!nc){ cerr << "Failed to initialize Notcurses\n"; return 1; }
+
+    unsigned rows, cols;
+    ncplane* stdplane = notcurses_stddim_yx(nc, &rows, &cols);
+
+    notcurses_cursor_enable(nc,0,0);
+    unsigned cursor_y=0, cursor_x=0;
+    unsigned scroll_y=0, scroll_x=0;
+    string status_msg; // transient message (save result, rename result, errors)
+
+    // Rename-mode state
+    bool renaming = false;
+    string rename_buffer;
+    unsigned rename_cursor = 0;
+
+    draw_buffer(stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x, rows, cols,
+                filename, nc, status_msg, renaming, rename_buffer, rename_cursor);
+
+    // Main event loop
+    handle_input(nc, stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x,
+                 rows, cols, filename, status_msg,
+                 renaming, rename_buffer, rename_cursor);
 
     if(!save_file(filename, lines)){
         cerr << "Warning: failed to save " << filename << " on exit.\n";
