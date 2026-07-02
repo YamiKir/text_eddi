@@ -4,10 +4,12 @@
 #include <vector>
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cerrno>
+#include <cstring>
 #include <sys/stat.h>
 #include <fstream>
 #include <locale>
-#include <cstring>
 
 #ifndef NC_RGB
 #define NC_RGB(r,g,b) (((r & 0xff)<<16) | ((g & 0xff)<<8) | (b & 0xff))
@@ -29,6 +31,11 @@ bool file_has_data(const string& filename){ //checks if a file is empty or not
     return st.st_size > 0;
 }
 
+bool file_exists(const string& filename){
+    struct stat st;
+    return stat(filename.c_str(), &st) == 0;
+}
+
 
 vector<string> read_file(const string& filename){ //turns the file into a series of vectors/lines
     std::ifstream in(filename);
@@ -40,8 +47,6 @@ vector<string> read_file(const string& filename){ //turns the file into a series
 }
 
 
-// Returns true on success. Caller is responsible for surfacing failure
-// to the user — we no longer fail silently.
 bool save_file(const string& filename, const vector<string>& lines){
     std::ofstream out(filename, std::ios::trunc);
     if(!out) return false;
@@ -50,14 +55,12 @@ bool save_file(const string& filename, const vector<string>& lines){
         if(i != lines.size()-1) out << "\n";
     }
     out.flush();
-    return (bool)out; // false if any write/flush failed
+    return (bool)out;
 }
 
 // ---- UTF-8 helpers ----
-// cursor_x is a BYTE offset into a std::string. These helpers keep it
-// pinned to codepoint boundaries so multi-byte characters (accents,
-// non-Latin scripts, etc.) never get split by cursor movement, backspace,
-// or delete.
+// Keep byte-offset cursors pinned to codepoint boundaries so multi-byte
+// characters never get split by cursor movement, backspace, or delete.
 bool utf8_is_cont(unsigned char c){ return (c & 0xC0) == 0x80; }
 
 size_t utf8_prev(const string& s, size_t pos){
@@ -74,9 +77,6 @@ size_t utf8_next(const string& s, size_t pos){
     return pos;
 }
 
-// Snaps a byte offset that may have landed mid-character (e.g. after
-// moving between lines of different content) back to the nearest
-// preceding codepoint boundary.
 size_t utf8_snap(const string& s, size_t pos){
     if(pos > s.size()) pos = s.size();
     while(pos > 0 && pos < s.size() && utf8_is_cont((unsigned char)s[pos])) pos--;
@@ -85,12 +85,9 @@ size_t utf8_snap(const string& s, size_t pos){
 
 // Manual US-QWERTY shift map, used ONLY as a fallback when the terminal
 // reports a Shift modifier but doesn't send a resolved shifted character
-// via ni.utf8 (this is a real gap in some terminals, VS Code's integrated
-// terminal included). This is a deliberate compromise: it fixes the
-// common case on US layouts, at the cost of being wrong on non-US
-// physical keyboards for that same fallback path. Terminals with full
-// Kitty protocol support (kitty, foot, wezterm, ghostty, ...) never hit
-// this path at all, since their ni.utf8 is already layout-correct.
+// via ni.utf8 (a real gap in some terminals). Terminals with full Kitty
+// protocol support never hit this path, since their ni.utf8 is already
+// layout-correct.
 char shifted_char(char c){
     switch(c){
         case '1': return '!';
@@ -125,7 +122,8 @@ void draw_buffer(ncplane* ns, const vector<string>& lines,
                  unsigned scroll_y, unsigned scroll_x,
                  unsigned rows, unsigned cols,
                  const string& filename, struct notcurses* nc,
-                 const string& status_msg){ //draw buffer and moves the hardware cursor
+                 const string& status_msg,
+                 bool renaming, const string& rename_buffer, unsigned rename_cursor){
 
     ncplane_erase(ns);
     unsigned ed_height = rows - 1; // last line reserved for status
@@ -134,7 +132,7 @@ void draw_buffer(ncplane* ns, const vector<string>& lines,
     ncplane_set_fg_rgb(ns, old_fg);
     ncplane_set_bg_rgb(ns, old_bg);
 
-    for(unsigned i=0;i<ed_height;i++){ //controls what is visibly displayed
+    for(unsigned i=0;i<ed_height;i++){
         unsigned line_idx = scroll_y + i;
         if(line_idx >= lines.size()) break;
         string line = lines[line_idx];
@@ -149,11 +147,14 @@ void draw_buffer(ncplane* ns, const vector<string>& lines,
     //status line at the bottom of application
     ncplane_set_bg_rgb(ns, NC_RGB(50,50,150));
     ncplane_set_fg_rgb(ns, NC_RGB(200,200,200));
-    if(!status_msg.empty()){
+    if(renaming){
+        ncplane_printf_yx(ns, rows-1, 0,
+            "Rename to: %s (Enter=confirm, ESC=cancel)", rename_buffer.c_str());
+    } else if(!status_msg.empty()){
         ncplane_printf_yx(ns, rows-1, 0, "[%s] %s", filename.c_str(), status_msg.c_str());
     } else {
         ncplane_printf_yx(ns, rows-1, 0,
-            "[%s] Line %u/%zu Col %u/%zu (ESC=quit, Ctrl+S=save)",
+            "[%s] Line %u/%zu Col %u/%zu (ESC=quit, Ctrl+S=save, Ctrl+R=rename)",
             filename.c_str(),
             cursor_y+1, lines.size(),
             cursor_x+1, lines[cursor_y].size());
@@ -163,10 +164,17 @@ void draw_buffer(ncplane* ns, const vector<string>& lines,
     ncplane_set_fg_rgb(ns, old_fg);
 
     //cursor logic
-    int screen_y = cursor_y - scroll_y;
-    int screen_x = cursor_x - scroll_x;
-    if(screen_y >= 0 && screen_y < (int)ed_height && screen_x >= 0 && screen_x < (int)cols){
-        notcurses_cursor_enable(nc, screen_y, screen_x);
+    if(renaming){
+        // Cursor sits inside the "Rename to: " prompt on the status line.
+        unsigned prefix_len = (unsigned)string("Rename to: ").size();
+        unsigned screen_x = prefix_len + rename_cursor;
+        notcurses_cursor_enable(nc, rows-1, screen_x);
+    } else {
+        int screen_y = cursor_y - scroll_y;
+        int screen_x = cursor_x - scroll_x;
+        if(screen_y >= 0 && screen_y < (int)ed_height && screen_x >= 0 && screen_x < (int)cols){
+            notcurses_cursor_enable(nc, screen_y, screen_x);
+        }
     }
 
     notcurses_render(nc);
@@ -197,9 +205,15 @@ int main(int argc, char* argv[]){
     notcurses_cursor_enable(nc,0,0);
     unsigned cursor_y=0, cursor_x=0;
     unsigned scroll_y=0, scroll_x=0;
-    string status_msg; // transient message (e.g. save result), overrides the hint line
+    string status_msg; // transient message (save result, rename result, errors)
 
-    draw_buffer(stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x, rows, cols, filename, nc, status_msg);
+    // Rename-mode state
+    bool renaming = false;
+    string rename_buffer;
+    unsigned rename_cursor = 0;
+
+    draw_buffer(stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x, rows, cols,
+                filename, nc, status_msg, renaming, rename_buffer, rename_cursor);
 
     ncinput ni;
     for(;;){
@@ -208,11 +222,21 @@ int main(int argc, char* argv[]){
         // Kitty keyboard protocol sends both press and release events.
         // We only want to act on press/repeat, not release.
         if(ni.evtype == NCTYPE_RELEASE) continue;
-        if(id == NCKEY_ESC) break;
 
-        // Defensive bounds check: nothing should ever push cursor_y out
-        // of range, but if a future edit introduces a bug, this stops
-        // an out-of-bounds vector access instead of crashing/corrupting.
+        // ESC behaves differently depending on mode: cancels renaming if
+        // we're in that mode, otherwise quits the editor as before.
+        if(id == NCKEY_ESC){
+            if(renaming){
+                renaming = false;
+                status_msg = "Rename cancelled.";
+                draw_buffer(stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x, rows, cols,
+                            filename, nc, status_msg, renaming, rename_buffer, rename_cursor);
+                continue;
+            }
+            break;
+        }
+
+        // Defensive bounds check against future edits introducing a bug.
         if(cursor_y >= lines.size()) cursor_y = lines.empty() ? 0 : (unsigned)lines.size()-1;
         if(lines.empty()) lines.push_back("");
 
@@ -221,11 +245,95 @@ int main(int argc, char* argv[]){
 
         bool is_ctrl_s = (ni.id == 19) ||
                           (ctrl_held && (ni.id == 's' || ni.id == 'S'));
+        bool is_ctrl_r = (ni.id == 18) || // legacy Ctrl+R byte code
+                          (ctrl_held && (ni.id == 'r' || ni.id == 'R'));
 
+        // ---------------- RENAME MODE ----------------
+        // While renaming, keystrokes edit rename_buffer instead of the
+        // document. Normal editing input is fully suspended so nothing
+        // leaks through into the buffer by accident.
+        if(renaming){
+            if(ni.id == NCKEY_ENTER || ni.id == '\n'){
+                string new_name = rename_buffer;
+                // trim accidental leading/trailing whitespace
+                while(!new_name.empty() && (new_name.front()==' '||new_name.front()=='\t'))
+                    new_name.erase(new_name.begin());
+                while(!new_name.empty() && (new_name.back()==' '||new_name.back()=='\t'))
+                    new_name.pop_back();
+
+                if(new_name.empty()){
+                    status_msg = "Rename cancelled: name cannot be empty.";
+                    renaming = false;
+                } else if(new_name == filename){
+                    status_msg = "Name unchanged.";
+                    renaming = false;
+                } else if(file_exists(new_name)){
+                    status_msg = "Rename failed: '" + new_name + "' already exists.";
+                    // stay in rename mode so the user can pick another name
+                } else {
+                    // True filesystem rename: moves the existing inode to
+                    // the new name, no leftover file under the old name.
+                    if(std::rename(filename.c_str(), new_name.c_str()) == 0){
+                        filename = new_name;
+                        status_msg = "Renamed to '" + filename + "'.";
+                        renaming = false;
+                    } else {
+                        status_msg = string("Rename failed: ") + std::strerror(errno);
+                        // stay in rename mode
+                    }
+                }
+            } else if(ni.id == NCKEY_BACKSPACE || ni.id == 127){
+                if(rename_cursor > 0){
+                    size_t start = utf8_prev(rename_buffer, rename_cursor);
+                    rename_buffer.erase(start, rename_cursor - start);
+                    rename_cursor = (unsigned)start;
+                }
+            } else if(ni.id == NCKEY_DEL){
+                if(rename_cursor < rename_buffer.size()){
+                    size_t end = utf8_next(rename_buffer, rename_cursor);
+                    rename_buffer.erase(rename_cursor, end - rename_cursor);
+                }
+            } else if(ni.id == NCKEY_LEFT){
+                if(rename_cursor > 0) rename_cursor = (unsigned)utf8_prev(rename_buffer, rename_cursor);
+            } else if(ni.id == NCKEY_RIGHT){
+                if(rename_cursor < rename_buffer.size()) rename_cursor = (unsigned)utf8_next(rename_buffer, rename_cursor);
+            } else if(ni.id == NCKEY_HOME){
+                rename_cursor = 0;
+            } else if(ni.id == NCKEY_END){
+                rename_cursor = (unsigned)rename_buffer.size();
+            } else if(ni.utf8[0] != '\0'){
+                char base = (ni.id >= 32 && ni.id < 127) ? (char)ni.id : '\0';
+                bool utf8_has_shifted = !(ni.utf8[1] == '\0' && base != '\0' && ni.utf8[0] == base);
+                string s;
+                if(utf8_has_shifted){
+                    s = string(ni.utf8);
+                } else if(shift_held && base != '\0'){
+                    s = string(1, shifted_char(base));
+                } else {
+                    s = string(ni.utf8);
+                }
+                rename_buffer.insert(rename_cursor, s);
+                rename_cursor += (unsigned)s.size();
+            } else if(ni.id >= 32 && ni.id < 127){
+                char c = (char)ni.id;
+                char to_insert = shift_held ? shifted_char(c) : c;
+                rename_buffer.insert(rename_cursor,1,to_insert);
+                rename_cursor++;
+            }
+
+            draw_buffer(stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x, rows, cols,
+                        filename, nc, status_msg, renaming, rename_buffer, rename_cursor);
+            continue; // skip normal-mode handling entirely while renaming
+        }
+
+        // ---------------- NORMAL EDITING MODE ----------------
         status_msg.clear(); // any keypress dismisses a prior status message
 
-		//control handling
-        if(ni.id == NCKEY_BACKSPACE || ni.id == 127){
+        if(is_ctrl_r){ // enter rename mode
+            renaming = true;
+            rename_buffer = filename;
+            rename_cursor = (unsigned)rename_buffer.size();
+        } else if(ni.id == NCKEY_BACKSPACE || ni.id == 127){
             if(cursor_x>0){
                 size_t start = utf8_prev(lines[cursor_y], cursor_x);
                 lines[cursor_y].erase(start, cursor_x - start);
@@ -235,6 +343,14 @@ int main(int argc, char* argv[]){
                 lines[cursor_y-1] += lines[cursor_y];
                 lines.erase(lines.begin()+cursor_y);
                 cursor_y--;
+            }
+        } else if(ni.id == NCKEY_DEL){
+            if(cursor_x < lines[cursor_y].size()){
+                size_t end = utf8_next(lines[cursor_y], cursor_x);
+                lines[cursor_y].erase(cursor_x, end - cursor_x);
+            } else if(cursor_y < lines.size()-1){
+                lines[cursor_y] += lines[cursor_y+1];
+                lines.erase(lines.begin()+cursor_y+1);
             }
         } else if(ni.id == NCKEY_ENTER || ni.id=='\n'){
             string rest = lines[cursor_y].substr(cursor_x);
@@ -256,6 +372,21 @@ int main(int argc, char* argv[]){
             if(cursor_y<lines.size()-1) cursor_y++;
             cursor_x = std::min(cursor_x,(unsigned)lines[cursor_y].size());
             cursor_x = (unsigned)utf8_snap(lines[cursor_y], cursor_x);
+        } else if(ni.id == NCKEY_HOME){
+            cursor_x = 0;
+        } else if(ni.id == NCKEY_END){
+            cursor_x = (unsigned)lines[cursor_y].size();
+        } else if(ni.id == NCKEY_PGUP){
+            unsigned ed_height = rows-1;
+            cursor_y = (cursor_y > ed_height) ? cursor_y - ed_height : 0;
+            cursor_x = std::min(cursor_x,(unsigned)lines[cursor_y].size());
+            cursor_x = (unsigned)utf8_snap(lines[cursor_y], cursor_x);
+        } else if(ni.id == NCKEY_PGDOWN){
+            unsigned ed_height = rows-1;
+            unsigned max_y = (unsigned)lines.size()-1;
+            cursor_y = std::min(cursor_y + ed_height, max_y);
+            cursor_x = std::min(cursor_x,(unsigned)lines[cursor_y].size());
+            cursor_x = (unsigned)utf8_snap(lines[cursor_y], cursor_x);
         } else if(is_ctrl_s){ // Ctrl+S
             bool ok = save_file(filename, lines);
             status_msg = ok ? "Saved." : "SAVE FAILED (check disk space / permissions).";
@@ -271,8 +402,7 @@ int main(int argc, char* argv[]){
                 cursor_x += (unsigned)s.size();
             } else if(shift_held && base != '\0'){
                 // Terminal gave us Shift-as-modifier but no resolved
-                // glyph (VS Code's terminal today). Apply the US-QWERTY
-                // fallback table.
+                // glyph. Apply the US-QWERTY fallback table.
                 char to_insert = shifted_char(base);
                 lines[cursor_y].insert(cursor_x,1,to_insert);
                 cursor_x++;
@@ -297,7 +427,8 @@ int main(int argc, char* argv[]){
         if(cursor_x < scroll_x) scroll_x = cursor_x;
         else if(cursor_x >= scroll_x + cols) scroll_x = cursor_x - cols +1;
 
-        draw_buffer(stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x, rows, cols, filename, nc, status_msg);
+        draw_buffer(stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x, rows, cols,
+                    filename, nc, status_msg, renaming, rename_buffer, rename_cursor);
     }
 
     if(!save_file(filename, lines)){
