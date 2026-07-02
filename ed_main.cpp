@@ -490,8 +490,7 @@ void handle_input(struct notcurses* nc, ncplane* stdplane, vector<string>& lines
         //vertical scrolling
        vertical_scroll(cursor_y, scroll_y, rows);
 
-        //horiz scrollingif(cursor_x < scroll_x) scroll_x = cursor_x;
-    else if(cursor_x >= scroll_x + cols) scroll_x = cursor_x - cols +1;
+        //horiz scrolling
         horizontal_scroll(cursor_x, scroll_x, cols);
 
         draw_buffer(stdplane, lines, cursor_y, cursor_x, scroll_y, scroll_x, rows, cols,
