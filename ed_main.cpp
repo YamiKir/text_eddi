@@ -10,9 +10,14 @@
 #include <sys/stat.h>
 #include <fstream>
 #include <locale>
+#include <unistd.h>
+
+
 #ifndef NC_RGB
 #define NC_RGB(r,g,b) (((r & 0xff)<<16) | ((g & 0xff)<<8) | (b & 0xff))
 #endif
+
+
 template <typename T>
 using vector = std::vector<T>;
 using string = std::string;
@@ -48,6 +53,9 @@ size_t utf8_prev(const string& s, size_t pos){
     while(pos > 0 && utf8_is_cont((unsigned char)s[pos])) pos--;
     return pos;
 }
+
+
+
 size_t utf8_next(const string& s, size_t pos){
     if(pos >= s.size()) return s.size();
     pos++;
@@ -165,9 +173,21 @@ private:
     bool renaming = false;
     string rename_buffer;
     unsigned rename_cursor = 0;
+    // ----- Piping -----
+    // Set when the initial buffer content came from a pipe on stdin
+    // rather than from a real file on disk. write_to_stdout additionally
+    // means there is no real save target at all -- the final buffer gets
+    // written to actual stdout once notcurses has released the terminal,
+    // e.g. `cat draft.txt | ./eddi - > final.txt`.
+    bool from_stdin = false;
+    bool write_to_stdout = false;
     // ----- Notcurses -----
     notcurses* nc = nullptr;
     ncplane* stdplane = nullptr;
+    // When real stdout has been redirected away from the terminal (e.g.
+    // because write_to_stdout is in play), notcurses can't draw the UI on
+    // stdout, so we give it the controlling terminal directly instead.
+    FILE* tty_out = nullptr;
 
 public:
     Edditor():
@@ -179,6 +199,7 @@ public:
 
     ~Edditor(){
         if(nc) notcurses_stop(nc);
+        if(tty_out) fclose(tty_out);
     }
 
     // Full lifecycle: load/create the file, bring up notcurses, run the
@@ -191,7 +212,15 @@ public:
         }
         draw_buffer();
         handle_input();
-        if(!save_to_disk()){
+        // notcurses_stop() (via the destructor path below would be too
+        // late) needs to happen before we touch real stdout, so tear it
+        // down explicitly here when we're about to write the buffer out.
+        if(write_to_stdout){
+            if(nc){ notcurses_stop(nc); nc = nullptr; }
+            if(!flush_to_stdout()){
+                cerr << "Warning: failed writing buffer to stdout.\n";
+            }
+        } else if(!save_to_disk()){
             cerr << "Warning: failed to save " << filename << " on exit.\n";
         }
     }
@@ -199,15 +228,54 @@ public:
 private:
     // ---- File I/O against this editor's own state ----
     void load_or_create_file(){
+        // Piping support: either the caller explicitly asked to read
+        // stdin (filename == "-"), or stdin simply isn't a terminal
+        // (e.g. `cat notes.txt | ./eddi`). Either way, treat piped
+        // input as the initial buffer instead of touching disk for it.
+        bool explicit_stdin = (filename == "-");
+        bool stdin_piped = explicit_stdin || !isatty(STDIN_FILENO);
+
+        if(stdin_piped){
+            from_stdin = true;
+            // NOTE: never print to std::cout here. If write_to_stdout is
+            // in play, real stdout IS the eventual save target (e.g.
+            // redirected to a file by the shell) -- anything we print to
+            // it before that point would land inside the saved file.
+            // Diagnostics always go to stderr instead.
+            cerr << "Reading piped input from stdin...\n";
+            lines.clear();
+            string line;
+            while(std::getline(std::cin, line)) lines.push_back(line);
+            if(lines.empty()) lines.push_back("");
+
+            if(explicit_stdin){
+                // "-" has no real on-disk target. Route the final saved
+                // buffer to actual stdout instead, so the whole thing can
+                // be chained, e.g. `cat a.txt | ./eddi - > b.txt`.
+                write_to_stdout = true;
+                filename = default_filename;
+            }
+
+            // We've now drained whatever was piped in. Reattach stdin to
+            // the controlling terminal so notcurses can still read live
+            // keyboard input for the rest of the interactive session --
+            // otherwise every subsequent read would just hit EOF.
+            if(!freopen("/dev/tty", "r", stdin)){
+                cerr << "Warning: couldn't reopen /dev/tty for keyboard "
+                        "input; interactive editing may not work.\n";
+            }
+            return;
+        }
+
         if(file_has_data(filename)){
-            cout << filename << " already exists, loading...\n";
+            cerr << filename << " already exists, loading...\n";
             std::ifstream in(filename);
             lines.clear();
             string line;
             while(getline(in,line)) lines.push_back(line);
             if(lines.empty()) lines.push_back("");
         } else {
-            cout << filename << " is new or empty, starting fresh...\n";
+            cerr << filename << " is new or empty, starting fresh...\n";
             std::ofstream initfile(filename);
             initfile.close();
             lines.clear();
@@ -224,11 +292,31 @@ private:
         out.flush();
         return (bool)out;
     }
+    // Only used when write_to_stdout is set, and only after notcurses has
+    // released the terminal -- writing here while notcurses is still
+    // live would corrupt whatever's on screen.
+    bool flush_to_stdout(){
+        for(size_t i=0;i<lines.size();++i){
+            std::cout << lines[i];
+            if(i != lines.size()-1) std::cout << "\n";
+        }
+        std::cout.flush();
+        return (bool)std::cout;
+    }
 
     bool init_notcurses(){
         setlocale(LC_ALL,"");
         notcurses_options opts{};
-        nc = notcurses_core_init(&opts, nullptr);
+        FILE* outfp = nullptr; // nullptr => notcurses defaults to stdout
+        if(!isatty(STDOUT_FILENO)){
+            // Real stdout has been redirected (piped to a file or another
+            // command, as happens with write_to_stdout) so notcurses has
+            // nothing to draw the UI on there -- give it the controlling
+            // terminal directly instead.
+            tty_out = fopen("/dev/tty", "w");
+            if(tty_out) outfp = tty_out;
+        }
+        nc = notcurses_core_init(&opts, outfp);
         if(!nc) return false;
         stdplane = notcurses_stddim_yx(nc, &rows, &cols);
         notcurses_cursor_enable(nc,0,0);
@@ -257,9 +345,10 @@ private:
             ncplane_printf_yx(stdplane, rows-1, 0, "[%s] %s", filename.c_str(), status_msg.c_str());
         } else {
             unsigned dcol = display_col(lines[cursor_y], (size_t)cursor_x);
+            const char* target = write_to_stdout ? "stdout" : filename.c_str();
             ncplane_printf_yx(stdplane, rows-1, 0,
                 "[%s] Line %u/%zu Col %u/%zu (ESC=quit, Ctrl+S=save, Ctrl+R=rename)",
-                filename.c_str(),
+                target,
                 cursor_y+1, lines.size(),
                 dcol+1, lines[cursor_y].size());
         }
@@ -408,9 +497,15 @@ private:
                               bool is_ctrl_r, bool is_ctrl_s){
         status_msg.clear(); // any keypress dismisses a prior status message
         if(is_ctrl_r){ // enter rename mode
-            renaming = true;
-            rename_buffer = filename;
-            rename_cursor = (unsigned)rename_buffer.size();
+            if(write_to_stdout){
+                // There's no real file to rename -- the buffer is headed
+                // to stdout on exit no matter what name is shown.
+                status_msg = "Rename disabled: output is piped to stdout.";
+            } else {
+                renaming = true;
+                rename_buffer = filename;
+                rename_cursor = (unsigned)rename_buffer.size();
+            }
         } else if(ni.id == NCKEY_BACKSPACE || ni.id == 127){
             if(cursor_x>0){
                 size_t start = utf8_prev(lines[cursor_y], cursor_x);
@@ -466,8 +561,17 @@ private:
             cursor_x = std::min(cursor_x,(unsigned)lines[cursor_y].size());
             cursor_x = (unsigned)utf8_snap(lines[cursor_y], cursor_x);
         } else if(is_ctrl_s){ // Ctrl+S
-            bool ok = save_to_disk();
-            status_msg = ok ? "Saved." : "SAVE FAILED (check disk space / permissions).";
+            if(write_to_stdout){
+                // Writing plain text to real stdout here, while notcurses
+                // is still actively rendering to the terminal, would
+                // corrupt the screen -- the buffer only gets flushed to
+                // stdout once, after notcurses releases the terminal on
+                // exit (see run()).
+                status_msg = "Output goes to stdout on exit (Ctrl+S disabled while piping).";
+            } else {
+                bool ok = save_to_disk();
+                status_msg = ok ? "Saved." : "SAVE FAILED (check disk space / permissions).";
+            }
         } else if(ni.id == NCKEY_TAB || ni.id == '\t'){
             // Insert a real tab byte. cursor_x still just advances by 1
             // byte here -- that part was always correct, since a tab is
